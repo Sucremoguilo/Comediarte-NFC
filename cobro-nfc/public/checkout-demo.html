@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Pagar</title>
+<style>
+  body {
+    font-family: -apple-system, system-ui, sans-serif;
+    background: #f5f5f7;
+    margin: 0; padding: 24px;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh;
+  }
+  .card {
+    background: white; border-radius: 20px; padding: 32px;
+    max-width: 360px; width: 100%; text-align: center;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+  }
+  h2 { margin-top: 0; }
+  .amount { font-size: 40px; font-weight: 800; margin: 16px 0; }
+  button {
+    width: 100%; padding: 16px; border: none; border-radius: 12px;
+    background: black; color: white; font-size: 18px; font-weight: 600;
+    margin-top: 12px;
+  }
+  .note { font-size: 12px; color: #888; margin-top: 20px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h2>Pagar</h2>
+    <div class="amount" id="amt">€0.00</div>
+    <button id="payBtn"> Pagar con Face ID</button>
+    <div class="note">
+      Esta es una pantalla de PRUEBA. Cuando conectes tu proveedor real
+      (PayRam, Rampex, etc), esta pagina la reemplaza el checkout hosteado
+      de ellos, con Apple Pay / Google Pay de verdad.
+    </div>
+  </div>
+<script>
+  const params = new URLSearchParams(location.search);
+  const amount = params.get("amount") || "0";
+  document.getElementById("amt").textContent = "€" + parseFloat(amount).toFixed(2);
+
+  document.getElementById("payBtn").addEventListener("click", async () => {
+    // En la vida real esto lo dispara el proveedor via webhook.
+    // Aca lo simulamos nosotros mismos para poder probar el flujo.
+    const sid = new URLSearchParams(location.search).get("sid");
+    await fetch("/api/demo-pagar", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sid }),
+    });
+    document.querySelector(".card").innerHTML = "<h2>✅ Pago aprobado</h2>";
+  });
+</script>
+</body>
+</html>

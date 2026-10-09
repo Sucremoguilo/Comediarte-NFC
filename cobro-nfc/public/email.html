@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Pagar</title>
+<style>
+  body { font-family:-apple-system,system-ui,sans-serif; background:#f5f5f7; margin:0; padding:24px;
+         display:flex; align-items:center; justify-content:center; min-height:100vh; }
+  .card { background:white; border-radius:20px; padding:32px; max-width:360px; width:100%; text-align:center;
+          box-shadow:0 10px 30px rgba(0,0,0,0.1); }
+  .amount { font-size:44px; font-weight:800; margin:8px 0 20px; }
+  input { width:100%; padding:16px; border:1px solid #ccc; border-radius:12px; font-size:17px; box-sizing:border-box; }
+  button { width:100%; padding:16px; border:none; border-radius:12px; background:black; color:white;
+           font-size:18px; font-weight:600; margin-top:12px; }
+  .hint { font-size:13px; color:#888; margin-top:14px; }
+  .error { color:#c00; font-size:14px; margin-bottom:10px; display:none; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div>Total a pagar</div>
+    <div class="amount" id="amt"></div>
+    <div class="error" id="err">Revisa el correo, parece incompleto.</div>
+    <input id="email" type="email" inputmode="email" autocomplete="email" placeholder="Tu correo" />
+    <button id="go">Continuar al pago</button>
+    <div class="hint">Lo usamos solo para el comprobante del pago.</div>
+  </div>
+<script>
+  const params = new URLSearchParams(location.search);
+  const sid = params.get("sid");
+  const monto = params.get("monto") || "0";
+  const moneda = params.get("moneda") || "EUR";
+  const simbolo = moneda === "EUR" ? "€" : moneda + " ";
+  document.getElementById("amt").textContent = simbolo + parseFloat(monto).toFixed(2);
+
+  const input = document.getElementById("email");
+  try { input.value = localStorage.getItem("cobro_email") || ""; } catch (e) {}
+  if (params.get("error")) document.getElementById("err").style.display = "block";
+
+  document.getElementById("go").addEventListener("click", () => {
+    const email = input.value.trim();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+      document.getElementById("err").style.display = "block";
+      return;
+    }
+    try { localStorage.setItem("cobro_email", email); } catch (e) {}
+    location.href = `/ir/${sid}?email=${encodeURIComponent(email)}`;
+  });
+</script>
+</body>
+</html>

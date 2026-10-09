@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Cobrar</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --green: #1db954;
+    --card: #1c1f26;
+    --text: #f5f5f5;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, system-ui, sans-serif;
+  }
+  #app {
+    height: 100%;
+    display: flex; flex-direction: column;
+    padding: env(safe-area-inset-top, 16px) 16px env(safe-area-inset-bottom, 16px);
+  }
+  #tagRow {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 14px; opacity: 0.7; margin-bottom: 8px;
+  }
+  #tagRow input {
+    background: var(--card); border: 1px solid #333; color: var(--text);
+    border-radius: 8px; padding: 6px 10px; width: 70px; text-align: center;
+  }
+  #display {
+    flex: 0 0 auto;
+    background: var(--card);
+    border-radius: 20px;
+    padding: 24px;
+    text-align: right;
+    font-size: 56px;
+    font-weight: 700;
+    margin-bottom: 16px;
+    min-height: 90px;
+  }
+  #keypad {
+    flex: 1;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+  }
+  .key {
+    background: var(--card);
+    border: none;
+    border-radius: 16px;
+    color: var(--text);
+    font-size: 32px;
+    font-weight: 600;
+  }
+  .key:active { background: #2a2e38; }
+  #cobrarBtn {
+    margin-top: 12px;
+    padding: 22px;
+    border: none;
+    border-radius: 16px;
+    background: var(--green);
+    color: white;
+    font-size: 26px;
+    font-weight: 700;
+  }
+  #waitScreen {
+    position: fixed; inset: 0;
+    background: var(--green);
+    color: white;
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 24px;
+  }
+  #waitScreen.show { display: flex; }
+  #waitAmount { font-size: 64px; font-weight: 800; margin-bottom: 12px; }
+  #cancelBtn {
+    margin-top: 40px;
+    background: rgba(255,255,255,0.2);
+    border: none;
+    color: white;
+    padding: 14px 28px;
+    border-radius: 12px;
+    font-size: 18px;
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="tagRow">
+    Cartel:
+    <input id="tagId" value="AB12" maxlength="8" />
+  </div>
+  <div id="display">0.00</div>
+  <div id="keypad">
+    <button class="key" data-k="1">1</button>
+    <button class="key" data-k="2">2</button>
+    <button class="key" data-k="3">3</button>
+    <button class="key" data-k="4">4</button>
+    <button class="key" data-k="5">5</button>
+    <button class="key" data-k="6">6</button>
+    <button class="key" data-k="7">7</button>
+    <button class="key" data-k="8">8</button>
+    <button class="key" data-k="9">9</button>
+    <button class="key" data-k=".">.</button>
+    <button class="key" data-k="0">0</button>
+    <button class="key" data-k="borrar">⌫</button>
+  </div>
+  <button id="cobrarBtn">Cobrar</button>
+</div>
+
+<div id="waitScreen">
+  <div id="waitTitle" style="font-size:28px;font-weight:700">Esperando pago...</div>
+  <div id="waitAmount">€0.00</div>
+  <div id="waitSub">Pedile al cliente que acerque el celular al cartel</div>
+  <button id="cancelBtn">Cancelar</button>
+</div>
+
+<audio id="chaChing" preload="auto">
+  <!-- Sonido simple generado por navegador, no requiere archivo externo -->
+</audio>
+
+<script>
+let monto = "0";
+const display = document.getElementById("display");
+const tagInput = document.getElementById("tagId");
+const waitScreen = document.getElementById("waitScreen");
+const waitAmount = document.getElementById("waitAmount");
+const waitTitle = document.getElementById("waitTitle");
+const waitSub = document.getElementById("waitSub");
+let poller = null;
+
+document.querySelectorAll(".key").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const k = btn.dataset.k;
+    if (k === "borrar") {
+      monto = monto.slice(0, -1) || "0";
+    } else if (k === "." && monto.includes(".")) {
+      // no permitir dos puntos
+    } else {
+      monto = monto === "0" && k !== "." ? k : monto + k;
+    }
+    display.textContent = monto;
+  });
+});
+
+function sonidoConfirmacion() {
+  // beep simple con la Web Audio API, sin archivos externos
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const o = ctx.createOscillator();
+  const g = ctx.createGain();
+  o.connect(g); g.connect(ctx.destination);
+  o.frequency.value = 880;
+  g.gain.setValueAtTime(0.2, ctx.currentTime);
+  o.start();
+  o.frequency.setValueAtTime(1320, ctx.currentTime + 0.12);
+  g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.35);
+  o.stop(ctx.currentTime + 0.35);
+}
+
+document.getElementById("cobrarBtn").addEventListener("click", async () => {
+  const amount = parseFloat(monto);
+  const tagId = tagInput.value.trim();
+  if (!amount || amount <= 0 || !tagId) return;
+
+  const resp = await fetch("/api/crear-cobro", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ tagId, amount }),
+  });
+  if (!resp.ok) {
+    alert("No se pudo crear el cobro");
+    return;
+  }
+
+  waitAmount.textContent = "€" + amount.toFixed(2);
+  waitScreen.classList.add("show");
+
+  waitTitle.textContent = "Esperando pago...";
+  waitSub.textContent = "Pedile al cliente que acerque el celular al cartel";
+
+  poller = setInterval(async () => {
+    const r = await fetch(`/api/estado/${tagId}`);
+    const data = await r.json();
+
+    if (data.status === "pagando") {
+      waitTitle.textContent = "Cliente pagando...";
+      waitSub.textContent = "No canceles, ya esta en el checkout";
+    } else if (data.status === "pagado") {
+      clearInterval(poller);
+      sonidoConfirmacion();
+      waitTitle.textContent = "✅ Cobrado";
+      waitSub.textContent = data.valueCoin ? `Recibiste ${data.valueCoin} USDC` : "";
+      monto = "0";
+      display.textContent = monto;
+      setTimeout(() => waitScreen.classList.remove("show"), 3000);
+    } else if (data.status === "expirado" || data.status === "cancelado" || data.status === "ninguna") {
+      clearInterval(poller);
+      waitTitle.textContent = "Cobro vencido";
+      waitSub.textContent = "El cliente no llego a pagar. Genera uno nuevo.";
+      setTimeout(() => waitScreen.classList.remove("show"), 2500);
+    }
+  }, 1500);
+});
+
+document.getElementById("cancelBtn").addEventListener("click", async () => {
+  clearInterval(poller);
+  waitScreen.classList.remove("show");
+  fetch("/api/cancelar", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ tagId: tagInput.value.trim() }),
+  });
+});
+</script>
+</body>
+</html>
