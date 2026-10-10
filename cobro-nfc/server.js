@@ -144,7 +144,7 @@ async function crearLinkRampex(p, email) {
 
   const plano = aplanar(data);
   // 1) la URL de pago (preferimos la larga; la corta es plan B)
-  const claves = ["payment_url", "paymentUrl", "checkout_url", "checkoutUrl", "url", "payment_link", "paymentLink", "link", "short_link", "shortLink", "short_url", "shortUrl"];
+  const claves = ["redirect_url", "redirectUrl", "payment_url", "paymentUrl", "checkout_url", "checkoutUrl", "url", "payment_link", "paymentLink", "link", "short_link", "shortLink", "short_url", "shortUrl"];
   let url = null;
   for (const c of claves) {
     const v = buscarValor(plano, [c]);
@@ -156,7 +156,7 @@ async function crearLinkRampex(p, email) {
     throw e;
   }
   // 2) el id del link (para reconocerlo en el aviso)
-  const id = buscarValor(plano, ["id", "payment_id", "paymentId", "link_id", "linkId", "payment_link_id", "paymentLinkId", "reference"]);
+  const id = buscarValor(plano, ["link_id", "linkId", "id", "payment_id", "paymentId", "link_id", "linkId", "payment_link_id", "paymentLinkId", "reference"]);
   return { url, linkId: id !== null ? String(id) : null };
 }
 
@@ -282,7 +282,7 @@ app.get("/gracias", (req, res) => {
 function marcarPagado(p, datos) {
   p.status = "pagado";
   p.paidAt = Date.now();
-  p.valueCoin = datos.valueCoin || null;
+  p.valueCoin = datos.valueCoin !== null && datos.valueCoin !== undefined ? String(datos.valueCoin) : null;
   p.txidOut = datos.txidOut || null;
   console.log(`[PAGADO] cartel=${p.tagId} monto=${p.amount} ${MONEDA} usdc_recibido=${p.valueCoin} tx=${p.txidOut}`);
 }
@@ -391,7 +391,7 @@ app.post("/api/rampex-webhook", (req, res) => {
     return res.status(400).send("monto menor");
   }
 
-  const valueCoin = buscarValor(plano, ["value_coin", "valueCoin", "amount_out", "amountOut", "usdc_amount", "net_amount"]);
+  const valueCoin = buscarValor(plano, ["received_amount", "receivedAmount", "value_coin", "valueCoin", "amount_out", "amountOut", "usdc_amount", "net_amount"]);
   const txidOut = buscarValor(plano, ["txid_out", "txidOut", "tx_hash", "txHash", "transaction_hash", "txid"]);
   marcarPagado(p, { valueCoin, txidOut });
   return res.send("ok");
