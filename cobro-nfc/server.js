@@ -2,29 +2,29 @@
 // COBRO NFC — conectado a Rampex (tarjeta/Apple Pay -> USDC en Polygon)
 // ============================================================
 // Flujo:
-//   1) Tipeas el monto en la calculadora  -> POST /api/crear-cobro
-//   2) El cliente toca el NFC -> /t/AB12 -> (pide email) -> /ir/<sid>
-//   3) En /ir/<sid> el servidor le pide a Rampex un "payment link" (ya
-//      con el email del cliente, que Rampex exige) y manda al cliente ahi.
-//   4) Cuando paga, Rampex llama a /api/rampex-webhook. El aviso se acepta
-//      SOLO si trae una firma valida (HMAC con tu webhook secret). Un aviso
-//      sin firma o con firma mala se rechaza y NO marca nada como cobrado.
+//   1) Tipeas el monto en la calculadora      -> POST /api/crear-cobro
+//   2) El cliente toca el NFC                  -> /t/AB12 -> pantalla de email
+//   3) El cliente pone su email                -> /ir/<sid>
+//      Ahi creamos el link de pago en Rampex (necesita el email) y lo
+//      mandamos al checkout.
+//   4) Cuando paga, Rampex llama a /api/rampex-webhook. Ese aviso viene
+//      FIRMADO: si la firma no coincide con tu secreto, se descarta.
 //
-// Variables de entorno (se cargan en el panel de Render / tu servidor):
-//   RAMPEX_API_KEY         tu API key de Rampex (es una contrasena).
-//   RAMPEX_WEBHOOK_SECRET  tu webhook secret de Rampex (es una contrasena).
-//   RAMPEX_API_URL         la URL base de la API que figura en rampex.io/api-docs
-//                          (o la URL completa de /api-create-payment-link).
-//   RAMPEX_PROVIDER        opcional: valor del campo "provider" (ej. "hosted").
-//   BASE_URL               la URL publica de tu servidor. En Render se toma sola.
+// Variables de entorno (panel de Render):
+//   RAMPEX_API_KEY         tu API key de Rampex.   (si falta -> MODO PRUEBA)
+//   RAMPEX_WEBHOOK_SECRET  tu webhook secret de Rampex.
 //   MONEDA                 EUR por defecto.
-//   PEDIR_EMAIL            "si" (defecto) pide el email al cliente antes de pagar.
-//                          "no" usa EMAIL_POR_DEFECTO para todos.
-//   EMAIL_POR_DEFECTO      solo se usa si PEDIR_EMAIL=no.
-//   La wallet de cobro se configura en el panel de Rampex
-//   (Default Polygon Wallet), no aca.
-//
-// Si falta alguna de las variables de Rampex, corre en MODO PRUEBA (pago falso).
+//   RAMPEX_PROVIDER_TITULAR   "banxa"  (primer medio que se intenta)
+//   RAMPEX_PROVIDER_SUPLENTE  "revolut" (si el titular falla o no esta disponible)
+//   ELEGIR_MEDIO              "si" (defecto): el cliente ve dos botones (Banxa / Revolut) y elige.
+//                             "no": va directo al titular (Banxa), sin elegir.
+//   RAMPEX_PROVIDER_FINAL     "hosted" (ultimo recurso: el cliente elige entre los disponibles)
+//   Si los nombres no coinciden con los de Rampex, el sistema NO se rompe: cae al
+//   siguiente de la lista. Los nombres exactos estan en "Payment Providers" de su API.
+//   PEDIR_EMAIL            "si" (defecto) / "no" (usa EMAIL_POR_DEFECTO).
+//   EMAIL_POR_DEFECTO      solo si PEDIR_EMAIL=no.
+// La wallet donde cobras se configura en el panel de Rampex
+// ("Default Polygon Wallet"), no aca.
 // ============================================================
 
 const express = require("express");
@@ -33,42 +33,37 @@ const crypto = require("crypto");
 
 const app = express();
 // El webhook necesita el cuerpo CRUDO para poder verificar la firma.
-app.use("/api/rampex-webhook", express.raw({ type: () => true, limit: "200kb" }));
+app.use("/api/rampex-webhook", express.raw({ type: "*/*", limit: "200kb" }));
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
 // ---- Tiempos --------------------------------------------------
-const TAP_TTL_MS = 45 * 1000;        // el cliente tiene 45s para tocar el NFC
-const PAGO_TTL_MS = 10 * 60 * 1000;  // una vez que toco, 10 min para pagar
+const TAP_TTL_MS = 45 * 1000;        // 45s para que el cliente toque el NFC
+const PAGO_TTL_MS = 10 * 60 * 1000;  // despues del toque, 10 min para pagar
 
 // ---- Configuracion --------------------------------------------
-const BASE_URL = (process.env.BASE_URL || process.env.RENDER_EXTERNAL_URL || "").replace(/\/$/, "");
-const MONEDA = (process.env.MONEDA || "EUR").toUpperCase();
-const PEDIR_EMAIL = (process.env.PEDIR_EMAIL || "si").toLowerCase() === "si";
-const EMAIL_POR_DEFECTO = (process.env.EMAIL_POR_DEFECTO || "").trim();
-
 const RAMPEX_API_KEY = (process.env.RAMPEX_API_KEY || "").trim();
 const RAMPEX_WEBHOOK_SECRET = (process.env.RAMPEX_WEBHOOK_SECRET || "").trim();
-const RAMPEX_PROVIDER = (process.env.RAMPEX_PROVIDER || "").trim();
-const RAMPEX_ENDPOINT = (() => {
-  let u = (process.env.RAMPEX_API_URL || "").trim().replace(/\/+$/, "");
-  if (!u) return "";
-  if (!/api-create-payment-link$/.test(u)) u += "/api-create-payment-link";
-  return u;
-})();
-
-const FALTAN = [];
-if (!RAMPEX_API_KEY) FALTAN.push("RAMPEX_API_KEY");
-if (!RAMPEX_WEBHOOK_SECRET) FALTAN.push("RAMPEX_WEBHOOK_SECRET");
-if (!RAMPEX_ENDPOINT) FALTAN.push("RAMPEX_API_URL");
-if (!BASE_URL) FALTAN.push("BASE_URL");
-const MODO_REAL = FALTAN.length === 0;
-const MONTO_MINIMO = 1;
+const RAMPEX_API = (process.env.RAMPEX_API_BASE || "https://api.rampex.io").replace(/\/$/, "");
+const BASE_URL = (process.env.BASE_URL || process.env.RENDER_EXTERNAL_URL || "").replace(/\/$/, "");
+const MONEDA = (process.env.MONEDA || "EUR").toUpperCase();
+// Orden de intento al crear el link de pago: titular -> suplente -> final.
+const PROV_TITULAR = (process.env.RAMPEX_PROVIDER_TITULAR || "banxa").trim();
+const PROV_SUPLENTE = (process.env.RAMPEX_PROVIDER_SUPLENTE || "revolut").trim();
+const PROV_FINAL = (process.env.RAMPEX_PROVIDER_FINAL || "hosted").trim();
+const ELEGIR_MEDIO = (process.env.ELEGIR_MEDIO || "si").toLowerCase() === "si";
+// Los dos botones que ve el cliente: titular y suplente (sin repetir ni incluir "hosted").
+const BOTONES = [...new Set([PROV_TITULAR, PROV_SUPLENTE].filter((x) => x && x !== PROV_FINAL))];
+const ORDEN_PROVEEDORES = [...new Set([PROV_TITULAR, PROV_SUPLENTE, PROV_FINAL].filter(Boolean))];
+const PEDIR_EMAIL = (process.env.PEDIR_EMAIL || "si").toLowerCase() === "si";
+const EMAIL_POR_DEFECTO = (process.env.EMAIL_POR_DEFECTO || "").trim();
+const MONTO_MINIMO = Number(process.env.MONTO_MINIMO || 1);
+const MOSTRAR_DETALLE = (process.env.MOSTRAR_DETALLE_ERRORES || "si").toLowerCase() === "si";
+const MODO_REAL = !!RAMPEX_API_KEY;
 
 // ---- Estado en memoria ----------------------------------------
 const payments = new Map(); // sid -> cobro
 const current = new Map();  // tagId -> sid del cobro vigente en ese cartel
-const porLinkId = new Map(); // id del payment link en Rampex -> sid
 
 function estadoActual(p) {
   if (p.status === "pagado" || p.status === "cancelado") return p.status;
@@ -78,86 +73,94 @@ function estadoActual(p) {
   return p.status;
 }
 
-function esc(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-}
-
 function paginaMensaje(titulo, detalle) {
   return `<html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head>
   <body style="font-family:sans-serif;text-align:center;padding:40px">
     <h2>${titulo}</h2><p>${detalle || ""}</p></body></html>`;
 }
 
-// ---- Utilidades para leer respuestas/avisos con nombres variables ----
-function aplanar(obj, prefijo = "", prof = 0, out = []) {
-  if (prof > 5 || obj === null || obj === undefined) return out;
+function escapar(s) {
+  return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+// Recorre cualquier JSON y devuelve todos los textos/numeros con su nombre de campo.
+function recolectarValores(obj, clave = "", out = []) {
+  if (obj === null || obj === undefined) return out;
+  if (Array.isArray(obj)) { obj.forEach((x) => recolectarValores(x, clave, out)); return out; }
   if (typeof obj === "object") {
-    for (const [k, v] of Object.entries(obj)) aplanar(v, prefijo ? `${prefijo}.${k}` : k, prof + 1, out);
-  } else {
-    out.push([prefijo, obj]);
+    for (const [k, v] of Object.entries(obj)) recolectarValores(v, k, out);
+    return out;
   }
+  out.push({ key: clave, value: String(obj) });
   return out;
 }
-const ultimaClave = (ruta) => ruta.split(".").pop().toLowerCase().replace(/[-_\s]/g, "");
 
-function buscarValor(plano, claves) {
-  for (const clave of claves) {
-    const k = clave.toLowerCase().replace(/[-_\s]/g, "");
-    const hit = plano.find(([ruta, v]) => ultimaClave(ruta) === k && v !== "" && v !== null);
-    if (hit) return hit[1];
-  }
-  return null;
+
+function etiquetaMedio(m) {
+  const n = m.toLowerCase();
+  if (n === "banxa") return `Tarjeta, Apple Pay o Google Pay<small>Banxa</small>`;
+  if (n === "revolut") return `Revolut<small>Si tenés cuenta de Revolut</small>`;
+  return escapar(m.charAt(0).toUpperCase() + m.slice(1));
 }
 
-// ---- Rampex: crear el payment link -----------------------------
-async function crearLinkRampex(p, email) {
-  const cuerpo = {
-    amount: Number(p.amount.toFixed(2)),
-    currency: MONEDA,
-    customer_email: email,
-    description: `Cobro NFC ${p.sid.slice(0, 8)}`,
-    woo_order_id: p.sid,             // Rampex nos lo devuelve en el aviso: sirve para ubicar el cobro
-    payment_url: `${BASE_URL}/gracias`,
-    ipn_token: p.ipnToken,
-  };
-  if (RAMPEX_PROVIDER) cuerpo.provider = RAMPEX_PROVIDER;
+function paginaElegir(p) {
+  const simbolo = MONEDA === "EUR" ? "€" : MONEDA + " ";
+  const botones = BOTONES.map(
+    (m) => `<a class="btn" href="/elegir/${p.sid}/${encodeURIComponent(m)}">${etiquetaMedio(m)}</a>`
+  ).join("");
+  return `<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1"><title>Pagar</title>
+  <style>
+    body{font-family:-apple-system,system-ui,sans-serif;background:#f5f5f7;margin:0;padding:24px;
+         display:flex;align-items:center;justify-content:center;min-height:100vh}
+    .card{background:#fff;border-radius:20px;padding:28px;max-width:360px;width:100%;text-align:center;
+          box-shadow:0 10px 30px rgba(0,0,0,.1)}
+    .monto{font-size:44px;font-weight:800;margin:6px 0 22px}
+    .btn{display:block;background:#000;color:#fff;text-decoration:none;border-radius:14px;padding:18px;
+         font-size:19px;font-weight:600;margin-top:12px}
+    .btn small{display:block;font-size:13px;font-weight:400;opacity:.7;margin-top:4px}
+  </style></head><body><div class="card">
+    <div>Total a pagar</div><div class="monto">${simbolo}${p.amount.toFixed(2)}</div>
+    <div>¿Cómo querés pagar?</div>${botones}
+  </div></body></html>`;
+}
 
-  const resp = await fetch(RAMPEX_ENDPOINT, {
+// ---- Rampex: crear el link de pago ----------------------------
+async function crearLinkEnRampex(p, email, proveedor) {
+  const resp = await fetch(`${RAMPEX_API}/api-create-payment-link`, {
     method: "POST",
     headers: { "X-API-Key": RAMPEX_API_KEY, "Content-Type": "application/json" },
-    body: JSON.stringify(cuerpo),
+    body: JSON.stringify({
+      amount: Number(p.amount.toFixed(2)),
+      currency: MONEDA,
+      customer_email: email,
+      description: "Pago en mostrador",
+      provider: proveedor,
+      ipn_token: p.refToken, // nuestro identificador para reconocer el pago despues
+    }),
   });
+
   const texto = await resp.text();
   let data = null;
-  try { data = JSON.parse(texto); } catch (_) { /* no era JSON */ }
-
-  if (!resp.ok) {
-    const e = new Error(`Rampex respondio ${resp.status}: ${texto.slice(0, 500)}`);
-    e.detalle = `Rampex respondio ${resp.status}: ${texto.slice(0, 500)}`;
-    throw e;
-  }
-  if (!data) {
-    const e = new Error("Rampex no devolvio JSON: " + texto.slice(0, 300));
-    e.detalle = "Rampex no devolvio JSON: " + texto.slice(0, 300);
-    throw e;
+  try { data = JSON.parse(texto); } catch (e) {}
+  if (!resp.ok || !data) {
+    throw new Error(`Rampex respondio ${resp.status}: ${texto.slice(0, 300)}`);
   }
 
-  const plano = aplanar(data);
-  // 1) la URL de pago (preferimos la larga; la corta es plan B)
-  const claves = ["redirect_url", "redirectUrl", "payment_url", "paymentUrl", "checkout_url", "checkoutUrl", "url", "payment_link", "paymentLink", "link", "short_link", "shortLink", "short_url", "shortUrl"];
-  let url = null;
-  for (const c of claves) {
-    const v = buscarValor(plano, [c]);
-    if (typeof v === "string" && /^https:\/\//i.test(v)) { url = v; break; }
+  const valores = recolectarValores(data);
+  const urls = valores.filter((v) => /^https?:\/\//i.test(v.value));
+  // Preferimos el link largo; si no hay, el corto.
+  const elegido = urls.find((v) => !/short/i.test(v.key)) || urls[0];
+  if (!elegido) {
+    throw new Error("Rampex no devolvio un link de pago reconocible: " + texto.slice(0, 300));
   }
-  if (!url) {
-    const e = new Error("Respuesta de Rampex sin URL de pago: " + texto.slice(0, 500));
-    e.detalle = "Rampex no devolvio una URL de pago. Respuesta: " + texto.slice(0, 500);
-    throw e;
-  }
-  // 2) el id del link (para reconocerlo en el aviso)
-  const id = buscarValor(plano, ["link_id", "linkId", "id", "payment_id", "paymentId", "link_id", "linkId", "payment_link_id", "paymentLinkId", "reference"]);
-  return { url, linkId: id !== null ? String(id) : null };
+
+  // Identificadores que Rampex pueda repetir en el aviso de pago.
+  const refs = valores
+    .map((v) => v.value)
+    .filter((v) => /^[A-Za-z0-9_-]{8,64}$/.test(v) || (/^https?:\/\//i.test(v) && v.length > 30));
+
+  return { url: elegido.value, refs: [...new Set(refs)] };
 }
 
 // ---- 1) La calculadora crea el cobro ---------------------------
@@ -172,18 +175,17 @@ app.post("/api/crear-cobro", (req, res) => {
     return res.status(400).json({ error: `El monto minimo es ${MONTO_MINIMO}` });
   }
 
-  const sid = crypto.randomBytes(16).toString("hex"); // imposible de adivinar
+  const sid = crypto.randomBytes(16).toString("hex");
   const ahora = Date.now();
-  const cobro = {
+  payments.set(sid, {
     sid, tagId, amount: monto, status: "esperando",
+    refToken: crypto.randomBytes(8).toString("hex"),
     createdAt: ahora,
     tapExpiresAt: ahora + TAP_TTL_MS,
     payExpiresAt: ahora + PAGO_TTL_MS,
-    ipnToken: crypto.randomBytes(16).toString("hex"),
-    checkoutUrl: null, linkId: null, creando: null, email: null,
+    email: null, checkoutUrl: null, linkRefs: [],
     valueCoin: null, txidOut: null,
-  };
-  payments.set(sid, cobro);
+  });
   current.set(tagId, sid);
   res.json({ ok: true, expiresInMs: TAP_TTL_MS, modo: MODO_REAL ? "real" : "prueba" });
 });
@@ -196,11 +198,13 @@ app.get("/api/estado/:tagId", (req, res) => {
   res.json({ status: estadoActual(p), amount: p.amount, valueCoin: p.valueCoin });
 });
 
-// ---- Cancelar (solo si el cliente todavia no toco el NFC) -----
+// ---- Cancelar (solo si el cliente todavia no llego al checkout) --
 app.post("/api/cancelar", (req, res) => {
   const sid = current.get(req.body.tagId);
   const p = sid && payments.get(sid);
-  if (p && p.status === "esperando") p.status = "cancelado";
+  if (p && (p.status === "esperando" || (p.status === "pagando" && !p.checkoutUrl))) {
+    p.status = "cancelado";
+  }
   res.json({ ok: true });
 });
 
@@ -220,13 +224,52 @@ app.get("/t/:tagId", (req, res) => {
     );
   }
 
-  if (PEDIR_EMAIL) {
-    return res.redirect(302, `/email.html?sid=${p.sid}&monto=${p.amount.toFixed(2)}&moneda=${MONEDA}`);
+  if (ELEGIR_MEDIO && BOTONES.length > 1) {
+    // Desde el toque el cobro queda "en curso": nadie mas puede tomarlo.
+    p.status = "pagando";
+    p.payExpiresAt = Date.now() + PAGO_TTL_MS;
+    return res.redirect(302, `/elegir/${sid}`);
   }
-  return res.redirect(302, `/ir/${p.sid}?email=${encodeURIComponent(EMAIL_POR_DEFECTO)}`);
+
+  if (PEDIR_EMAIL) {
+    // Desde el toque el cobro queda "en curso": nadie mas puede tomarlo
+    // y el cliente tiene tiempo de sobra para escribir su email.
+    p.status = "pagando";
+    p.payExpiresAt = Date.now() + PAGO_TTL_MS;
+    return res.redirect(302, `/email.html?sid=${sid}&monto=${p.amount.toFixed(2)}&moneda=${MONEDA}`);
+  }
+  return res.redirect(302, `/ir/${sid}?email=${encodeURIComponent(EMAIL_POR_DEFECTO)}`);
 });
 
-// ---- 3b) Paso final: crear el link en Rampex y mandar al cliente ----
+
+// ---- 3a) El cliente elige: Banxa o Revolut ----------------------
+function siguientePaso(p) {
+  if (PEDIR_EMAIL) return `/email.html?sid=${p.sid}&monto=${p.amount.toFixed(2)}&moneda=${MONEDA}`;
+  return `/ir/${p.sid}?email=${encodeURIComponent(EMAIL_POR_DEFECTO)}`;
+}
+
+app.get("/elegir/:sid", (req, res) => {
+  const p = payments.get(req.params.sid);
+  if (!p) return res.status(404).send(paginaMensaje("Cobro no encontrado"));
+  const est = estadoActual(p);
+  if (est === "pagado") return res.send(paginaMensaje("Este cobro ya fue pagado ✅"));
+  if (est === "expirado" || est === "cancelado") {
+    return res.send(paginaMensaje("Este cobro vencio", "Pedile al comercio que genere uno nuevo."));
+  }
+  if (p.checkoutUrl) return res.redirect(302, p.checkoutUrl);
+  res.send(paginaElegir(p));
+});
+
+app.get("/elegir/:sid/:medio", (req, res) => {
+  const p = payments.get(req.params.sid);
+  if (!p) return res.status(404).send(paginaMensaje("Cobro no encontrado"));
+  if (p.checkoutUrl) return res.redirect(302, p.checkoutUrl);
+  if (!BOTONES.includes(req.params.medio)) return res.redirect(302, `/elegir/${p.sid}`);
+  p.medio = req.params.medio;
+  res.redirect(302, siguientePaso(p));
+});
+
+// ---- 3b) Armar el link de pago y mandar al cliente ------------
 app.get("/ir/:sid", async (req, res) => {
   const p = payments.get(req.params.sid);
   if (!p) return res.status(404).send(paginaMensaje("Cobro no encontrado"));
@@ -236,165 +279,116 @@ app.get("/ir/:sid", async (req, res) => {
   if (est === "expirado" || est === "cancelado") {
     return res.send(paginaMensaje("Este cobro vencio", "Pedile al comercio que genere uno nuevo."));
   }
+  // Si ya tiene link creado, el cliente simplemente vuelve al mismo checkout.
+  if (p.checkoutUrl) return res.redirect(302, p.checkoutUrl);
 
   const email = String(req.query.email || "").trim();
-  const emailOk = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email);
-  if (!emailOk) {
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
     if (PEDIR_EMAIL) return res.redirect(302, `/email.html?sid=${p.sid}&monto=${p.amount.toFixed(2)}&moneda=${MONEDA}&error=1`);
     return res.status(500).send(paginaMensaje("Falta configurar EMAIL_POR_DEFECTO"));
   }
 
+  p.status = "pagando";
+  p.email = email;
+  p.payExpiresAt = Date.now() + PAGO_TTL_MS;
+
   if (!MODO_REAL) {
-    p.status = "pagando";
-    p.email = email;
-    p.payExpiresAt = Date.now() + PAGO_TTL_MS;
-    return res.redirect(302, `/checkout-demo.html?amount=${p.amount}&sid=${p.sid}`);
-  }
-
-  try {
-    // Si el cliente recarga la pagina, reusamos el mismo link (no creamos otro).
-    if (!p.checkoutUrl || p.email !== email) {
-      if (!p.creando) {
-        p.creando = crearLinkRampex(p, email).finally(() => { p.creando = null; });
-      }
-      const { url, linkId } = await p.creando;
-      p.checkoutUrl = url;
-      p.linkId = linkId;
-      p.email = email;
-      if (linkId) porLinkId.set(linkId, p.sid);
-    }
-    p.status = "pagando";
-    p.payExpiresAt = Date.now() + PAGO_TTL_MS;
+    p.checkoutUrl = `/checkout-demo.html?amount=${p.amount}&sid=${p.sid}`;
     return res.redirect(302, p.checkoutUrl);
-  } catch (err) {
-    console.error("[ERROR] No se pudo crear el link en Rampex:", err.message);
-    return res.status(502).send(
-      paginaMensaje("No se pudo iniciar el pago", esc(err.detalle || err.message))
-    );
   }
+
+  // Probamos titular -> suplente -> final. El primero que responda con un link gana.
+  const fallos = [];
+  const orden = p.medio ? [p.medio, ...ORDEN_PROVEEDORES.filter((x) => x !== p.medio)] : ORDEN_PROVEEDORES;
+  for (const proveedor of orden) {
+    try {
+      const { url, refs } = await crearLinkEnRampex(p, email, proveedor);
+      p.checkoutUrl = url;
+      p.linkRefs = refs;
+      p.proveedor = proveedor;
+      console.log(`[PROVEEDOR] cartel=${p.tagId} monto=${p.amount} usado=${proveedor}` +
+                  (fallos.length ? ` (antes fallaron: ${fallos.map((f) => f.proveedor).join(", ")})` : ""));
+      return res.redirect(302, url);
+    } catch (err) {
+      console.error(`[PROVEEDOR] fallo "${proveedor}":`, err.message);
+      fallos.push({ proveedor, mensaje: err.message });
+    }
+  }
+
+  p.status = "cancelado";
+  const detalle = fallos.map((f) => `${escapar(f.proveedor)}: ${escapar(f.mensaje)}`).join("<br>");
+  return res.status(502).send(
+    paginaMensaje(
+      "No se pudo iniciar el pago",
+      MOSTRAR_DETALLE ? `<small>${detalle}</small>` : "Proba de nuevo en un momento."
+    )
+  );
 });
 
-app.get("/gracias", (req, res) => {
-  res.send(paginaMensaje("Gracias ✅", "Si el pago se completo, el comercio lo va a ver en su pantalla."));
-});
-
-// ---- 4) Aviso de pago de Rampex (SE VERIFICA LA FIRMA, no se confia) --
+// ---- 4) Aviso de pago de Rampex (FIRMADO) ----------------------
 function marcarPagado(p, datos) {
   p.status = "pagado";
   p.paidAt = Date.now();
-  p.valueCoin = datos.valueCoin !== null && datos.valueCoin !== undefined ? String(datos.valueCoin) : null;
-  p.txidOut = datos.txidOut || null;
-  console.log(`[PAGADO] cartel=${p.tagId} monto=${p.amount} ${MONEDA} usdc_recibido=${p.valueCoin} tx=${p.txidOut}`);
+  p.valueCoin = datos.valueCoin || null;
+  console.log(`[PAGADO] cartel=${p.tagId} monto=${p.amount} ${MONEDA} usdc=${p.valueCoin || "?"}`);
 }
 
-function iguales(a, b) {
-  const A = Buffer.from(String(a)), B = Buffer.from(String(b));
-  return A.length === B.length && crypto.timingSafeEqual(A, B);
+function firmaValida(raw, headerFirma) {
+  if (!RAMPEX_WEBHOOK_SECRET) return false;
+  const firma = String(headerFirma || "").trim().toLowerCase().replace(/^sha256=/, "");
+  const esperada = crypto.createHmac("sha256", RAMPEX_WEBHOOK_SECRET).update(raw).digest("hex");
+  if (firma.length !== esperada.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(firma), Buffer.from(esperada));
 }
-
-// Acepta la firma si: (a) alguna cabecera trae el HMAC-SHA256 del cuerpo
-// calculado con tu webhook secret (hex o base64, con o sin prefijo, con o sin
-// timestamp), o (b) alguna cabecera trae el secreto tal cual (esquema de
-// "secreto compartido"). Sin el secreto nadie puede producir ninguna de las dos.
-function firmaValida(req, raw) {
-  const secret = RAMPEX_WEBHOOK_SECRET;
-  const cuerpo = raw.toString("utf8");
-  const esperados = new Set();
-  const marcasDeTiempo = [""];
-  for (const h of ["x-timestamp", "x-rampex-timestamp", "x-webhook-timestamp", "timestamp"]) {
-    if (req.headers[h]) marcasDeTiempo.push(String(req.headers[h]));
-  }
-  // formato tipo Stripe: "t=123,v1=abc"
-  for (const val of Object.values(req.headers)) {
-    const m = /(?:^|[,;\s])t=(\d+)/.exec(String(val));
-    if (m) marcasDeTiempo.push(m[1]);
-  }
-  for (const ts of marcasDeTiempo) {
-    const mensaje = ts ? `${ts}.${cuerpo}` : cuerpo;
-    const mac = crypto.createHmac("sha256", secret).update(mensaje);
-    const buf = mac.digest();
-    esperados.add(buf.toString("hex"));
-    esperados.add(buf.toString("base64"));
-  }
-  for (const [nombre, valor] of Object.entries(req.headers)) {
-    if (["host", "content-length", "content-type", "user-agent", "accept", "connection"].includes(nombre)) continue;
-    const trozos = String(valor).split(/[,;\s]+/).flatMap((t) => [t, t.includes("=") ? t.slice(t.indexOf("=") + 1) : t]);
-    for (let t of trozos) {
-      t = t.replace(/^Bearer$/i, "");
-      if (!t) continue;
-      if (iguales(t, secret)) return true;                        // secreto compartido
-      for (const e of esperados) if (iguales(t, e)) return true;  // HMAC
-    }
-  }
-  return false;
-}
-
-const ESTADOS_PAGADO = new Set(["paid", "completed", "complete", "confirmed", "success", "succeeded", "settled", "paymentcompleted", "paymentpaid", "paymentsucceeded"]);
 
 app.post("/api/rampex-webhook", (req, res) => {
-  if (!MODO_REAL) return res.status(400).send("modo prueba");
+  if (!RAMPEX_WEBHOOK_SECRET) {
+    console.log("[WEBHOOK] llego un aviso pero falta RAMPEX_WEBHOOK_SECRET: se descarta");
+    return res.status(503).send("webhook secret no configurado");
+  }
   const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from("");
 
-  if (!firmaValida(req, raw)) {
-    console.log(`[AVISO RECHAZADO] firma invalida o ausente. cabeceras recibidas: ${Object.keys(req.headers).join(", ")} (cuerpo ${raw.length} bytes)`);
-    return res.status(401).send("firma invalida");
+  if (!firmaValida(raw, req.get("x-rampex-signature"))) {
+    console.log("[WEBHOOK] firma invalida o ausente: se descarta");
+    return res.status(401).send("bad signature");
   }
 
   let data;
-  const texto = raw.toString("utf8");
-  try { data = JSON.parse(texto); }
-  catch (_) {
-    try { data = Object.fromEntries(new URLSearchParams(texto)); } catch (_2) { data = null; }
+  try { data = JSON.parse(raw.toString("utf8")); } catch (e) { return res.status(400).send("bad json"); }
+  console.log("[WEBHOOK] aviso valido:", JSON.stringify(data).slice(0, 800));
+
+  const valores = recolectarValores(data);
+  const textos = valores.map((v) => v.value);
+
+  // Estado del pago segun el aviso
+  const estados = valores.filter((v) => /status|event|type|state/i.test(v.key)).map((v) => v.value.toLowerCase());
+  const malo = estados.some((v) => /(fail|cancel|expire|refund|reject|declin|pend)/.test(v));
+  const bueno = estados.some((v) => /(paid|success|succeed|complet|confirm|settled|approv)/.test(v));
+  if (estados.length && (malo || !bueno)) {
+    console.log("[WEBHOOK] el aviso no indica pago completado:", estados.join(", "));
+    return res.send("ok");
   }
-  if (!data || typeof data !== "object") return res.status(400).send("cuerpo ilegible");
+  if (!estados.length) console.log("[AVISO] el aviso no trae campo de estado; se toma como pago confirmado");
 
-  const plano = aplanar(data);
-
-  // Ubicar el cobro: por nuestro sid (woo_order_id) o por el id del link de Rampex.
-  let p = null;
-  for (const [, v] of plano) {
-    const s = String(v);
-    if (payments.has(s)) { p = payments.get(s); break; }
+  // Reconocer a que cobro pertenece
+  const candidatos = [...payments.values()].filter((c) => c.status === "pagando");
+  let p = candidatos.find((c) => textos.includes(c.refToken))
+       || candidatos.find((c) => c.linkRefs.some((r) => textos.includes(r)));
+  if (!p) {
+    const montosAviso = valores.map((v) => Number(v.value)).filter((n) => !Number.isNaN(n));
+    p = candidatos
+      .filter((c) => c.email && textos.some((t) => t.toLowerCase() === c.email.toLowerCase())
+                     && montosAviso.some((n) => Math.abs(n - c.amount) < 0.01))
+      .sort((a, b) => b.createdAt - a.createdAt)[0];
   }
   if (!p) {
-    for (const [, v] of plano) {
-      const sid = porLinkId.get(String(v));
-      if (sid) { p = payments.get(sid); break; }
-    }
-  }
-  if (!p) {
-    console.log("[AVISO] firma valida pero no reconozco el cobro. Campos:", plano.map(([k]) => k).join(", "));
-    return res.status(404).send("cobro desconocido");
-  }
-  if (p.status === "pagado") return res.send("ok");
-
-  // Si el aviso trae nuestro ipn_token, tiene que coincidir.
-  const tokenAviso = buscarValor(plano, ["ipn_token", "ipnToken"]);
-  if (tokenAviso !== null && !iguales(tokenAviso, p.ipnToken)) {
-    console.log("[AVISO RECHAZADO] ipn_token no coincide");
-    return res.status(401).send("token invalido");
+    console.log("[WEBHOOK] aviso valido pero no pude asociarlo a ningun cobro en curso");
+    return res.send("ok");
   }
 
-  // Estado: solo se marca pagado si dice explicitamente que esta pagado.
-  const estadoCrudo = buscarValor(plano, ["status", "payment_status", "paymentStatus", "state", "event", "type"]);
-  const estado = String(estadoCrudo || "").toLowerCase().replace(/[^a-z]/g, "");
-  if (!ESTADOS_PAGADO.has(estado)) {
-    console.log(`[AVISO] estado '${estadoCrudo}' (no es pagado). Campos: ${plano.map(([k]) => k).join(", ")}`);
-    return res.status(202).send("pendiente");
-  }
-
-  // Monto: si el aviso informa monto y moneda y la moneda coincide, no puede ser menor.
-  const moneda = buscarValor(plano, ["currency", "fiat_currency", "fiatCurrency"]);
-  const monto = Number(buscarValor(plano, ["amount", "fiat_amount", "fiatAmount", "amount_fiat"]));
-  if (moneda && String(moneda).toUpperCase() === MONEDA && Number.isFinite(monto) && monto + 0.01 < p.amount) {
-    console.log(`[AVISO RECHAZADO] monto ${monto} menor al cobro ${p.amount}`);
-    return res.status(400).send("monto menor");
-  }
-
-  const valueCoin = buscarValor(plano, ["received_amount", "receivedAmount", "value_coin", "valueCoin", "amount_out", "amountOut", "usdc_amount", "net_amount"]);
-  const txidOut = buscarValor(plano, ["txid_out", "txidOut", "tx_hash", "txHash", "transaction_hash", "txid"]);
-  marcarPagado(p, { valueCoin, txidOut });
-  return res.send("ok");
+  const usdc = valores.find((v) => /usdc|value_coin|settle|payout|received/i.test(v.key) && !Number.isNaN(Number(v.value)));
+  marcarPagado(p, { valueCoin: usdc ? usdc.value : null });
+  res.send("ok");
 });
 
 // ---- Solo en MODO PRUEBA: el boton "Pagar" falso --------------
@@ -402,28 +396,24 @@ app.post("/api/demo-pagar", (req, res) => {
   if (MODO_REAL) return res.status(403).json({ error: "No disponible en modo real" });
   const p = payments.get(req.body.sid);
   if (!p) return res.status(404).json({ error: "no existe" });
-  marcarPagado(p, { valueCoin: String(p.amount), txidOut: "demo" });
+  marcarPagado(p, { valueCoin: String(p.amount) });
   res.json({ ok: true });
 });
 
 // ---- Limpieza de memoria --------------------------------------
 setInterval(() => {
   const limite = Date.now() - 24 * 60 * 60 * 1000;
-  for (const [sid, p] of payments) {
-    if (p.createdAt < limite) {
-      payments.delete(sid);
-      if (p.linkId) porLinkId.delete(p.linkId);
-    }
-  }
+  for (const [sid, p] of payments) if (p.createdAt < limite) payments.delete(sid);
 }, 10 * 60 * 1000).unref();
 
 const PORT = process.env.PORT || 3000;
-if (require.main === module) {
-  app.listen(PORT, () => {
-    console.log(`Cobro NFC en puerto ${PORT} — modo: ${MODO_REAL ? "REAL (Rampex)" : "PRUEBA (pago falso)"}`);
-    if (!MODO_REAL) console.log(`[ATENCION] Para el modo real faltan: ${FALTAN.join(", ")}`);
-    if (MODO_REAL) console.log(`[OK] Aviso de pago en: ${BASE_URL}/api/rampex-webhook  (cargalo como Webhook URL en el panel de Rampex)`);
-    if (!PEDIR_EMAIL && !EMAIL_POR_DEFECTO) console.log("[ATENCION] PEDIR_EMAIL=no pero falta EMAIL_POR_DEFECTO");
-  });
-}
-module.exports = app;
+app.listen(PORT, () => {
+  console.log(`Cobro NFC en puerto ${PORT} — modo: ${MODO_REAL ? "REAL (Rampex)" : "PRUEBA (pago falso)"}`);
+  if (MODO_REAL) {
+    console.log(`Orden de medios de pago: ${ORDEN_PROVEEDORES.join(" -> ")}`);
+    console.log(`El cliente elige el medio: ${ELEGIR_MEDIO && BOTONES.length > 1 ? "SI (botones " + BOTONES.join(" / ") + ")" : "no (va directo al titular)"}`);
+    console.log(`Webhook para pegar en Rampex: ${BASE_URL || "(falta BASE_URL)"}/api/rampex-webhook`);
+    if (!RAMPEX_WEBHOOK_SECRET) console.log("[ATENCION] Falta RAMPEX_WEBHOOK_SECRET: no se van a poder confirmar los pagos");
+  }
+  if (!PEDIR_EMAIL && !EMAIL_POR_DEFECTO) console.log("[ATENCION] PEDIR_EMAIL=no pero falta EMAIL_POR_DEFECTO");
+});
