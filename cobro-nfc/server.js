@@ -122,7 +122,18 @@ function paginaElegir(p) {
   </style></head><body><div class="card">
     <div>Total a pagar</div><div class="monto">${simbolo}${p.amount.toFixed(2)}</div>
     <div>¿Cómo querés pagar?</div>${botones}
-  </div></body></html>`;
+  </div>
+  <script>
+    var yaElegido = false;
+    document.querySelectorAll(".btn").forEach(function (b) {
+      b.addEventListener("click", function (e) {
+        if (yaElegido) { e.preventDefault(); return; }
+        yaElegido = true;
+        document.querySelectorAll(".btn").forEach(function (x) { if (x !== b) x.style.opacity = ".3"; });
+        b.innerHTML = "Conectando…<small>Esto puede tardar unos segundos</small>";
+      });
+    });
+  </script></body></html>`;
 }
 
 // ---- Rampex: crear el link de pago ----------------------------
@@ -302,11 +313,13 @@ app.get("/ir/:sid", async (req, res) => {
   const orden = p.medio ? [p.medio, ...ORDEN_PROVEEDORES.filter((x) => x !== p.medio)] : ORDEN_PROVEEDORES;
   for (const proveedor of orden) {
     try {
+      const t0 = Date.now();
       const { url, refs } = await crearLinkEnRampex(p, email, proveedor);
+      const tardo = Date.now() - t0;
       p.checkoutUrl = url;
       p.linkRefs = refs;
       p.proveedor = proveedor;
-      console.log(`[PROVEEDOR] cartel=${p.tagId} monto=${p.amount} usado=${proveedor}` +
+      console.log(`[PROVEEDOR] cartel=${p.tagId} monto=${p.amount} usado=${proveedor} tardo=${tardo}ms` +
                   (fallos.length ? ` (antes fallaron: ${fallos.map((f) => f.proveedor).join(", ")})` : ""));
       return res.redirect(302, url);
     } catch (err) {
